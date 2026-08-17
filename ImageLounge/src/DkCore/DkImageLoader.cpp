@@ -40,6 +40,10 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QDateTime>
+#include <QSet>
+
+#include <algorithm>
 #include <QDesktopServices>
 #include <QDir>
 #include <QDirIterator>
@@ -662,6 +666,50 @@ bool DkImageLoader::promptSaveBeforeUnload()
  * should save some memory. In addition, all signals are mBlocked.
  * @param isActive if true, the loader is activated
  **/
+void DkImageLoader::suppressDirWatcher(int ms)
+{
+    mIgnoreDirChangesUntil = QDateTime::currentMSecsSinceEpoch() + qMax(0, ms);
+    if (mDirWatcher)
+        mDirWatcher->blockSignals(true);
+}
+
+void DkImageLoader::resumeDirWatcher()
+{
+    if (mDirWatcher)
+        mDirWatcher->blockSignals(false);
+}
+
+void DkImageLoader::removeFilesFromIndex(const QStringList &paths)
+{
+    if (paths.isEmpty())
+        return;
+
+    const QSet<QString> gone(paths.begin(), paths.end());
+    const QString currentPath = mCurrentImage ? mCurrentImage->filePath() : QString();
+    const int oldIdx = currentPath.isEmpty() ? -1 : findFileIdx(currentPath, mImages);
+    const bool currentGone = gone.contains(currentPath);
+
+    mImages.erase(std::remove_if(mImages.begin(),
+                                 mImages.end(),
+                                 [&](const QSharedPointer<DkImageContainerT> &img) {
+                                     return img && gone.contains(img->filePath());
+                                 }),
+                  mImages.end());
+
+    if (currentGone) {
+        if (mImages.isEmpty()) {
+            mCurrentImage.clear();
+        } else {
+            int nextIdx = oldIdx;
+            if (nextIdx < 0)
+                nextIdx = 0;
+            if (nextIdx >= mImages.size())
+                nextIdx = mImages.size() - 1;
+            load(mImages.at(nextIdx));
+        }
+    }
+}
+
 void DkImageLoader::activate(bool isActive /* = true */)
 {
     if (!isActive) {
@@ -777,7 +825,18 @@ void DkImageLoader::load(QSharedPointer<DkImageContainerT> image /* = QSharedPoi
 
     setCurrentImage(image);
 
-    if (mCurrentImage && mCurrentImage->getLoadState() == DkImageContainerT::loading)
+    if (!mCurrentImage)
+        return;
+
+    // Prefetch/cacher often already has the next image. loadImageThreaded()
+    // still calls isModified()/exists() which are multi-hundred-ms SMB stats
+    // and used to waitForFinished() on an in-flight decode.
+    if (mCurrentImage->getLoadState() == DkImageContainerT::loaded && mCurrentImage->hasImage()) {
+        imageLoaded(true);
+        return;
+    }
+
+    if (mCurrentImage->getLoadState() == DkImageContainerT::loading)
         return;
 
     emit updateSpinnerSignalDelayed(true);
@@ -1313,7 +1372,7 @@ void DkImageLoader::updateHistory()
  **/
 bool DkImageLoader::deleteFile()
 {
-    if (!mCurrentImage || !mCurrentImage->exists())
+    if (!mCurrentImage)
         return false;
 
     if (mCurrentImage->fileInfo().isFromZip()) {
@@ -1321,17 +1380,39 @@ bool DkImageLoader::deleteFile()
         return false;
     }
 
-    QString fileName = mCurrentImage->fileName();
-    int currFileIdx = findFileIdx(mCurrentImage->filePath(), mImages);
-    if (!DkUtils::moveToTrash({mCurrentImage->filePath()})) {
+    const QString fileName = mCurrentImage->fileName();
+    const int currFileIdx = findFileIdx(mCurrentImage->filePath(), mImages);
+
+    // QFileSystemWatcher would treat this as an external folder edit and
+    // re-run readDirectory()+sort() on the whole share. That is seconds on
+    // a large network folder — we already know which file left the list.
+    DkTimer dt;
+    suppressDirWatcher();
+    const bool deleted = DkUtils::moveToTrash({mCurrentImage->filePath()});
+    resumeDirWatcher();
+    qInfo() << "[deleteFile] moveToTrash" << dt;
+
+    if (!deleted) {
         emit showInfoSignal(tr("Sorry, I could not delete: %1").arg(fileName));
         return false;
     }
 
-    mImages.removeAt(currFileIdx);
-    QSharedPointer<DkImageContainerT> imgC = getSkippedImage(1);
-    if (!imgC)
-        imgC = getSkippedImage(0); // deleted from the end
+    if (currFileIdx >= 0 && currFileIdx < mImages.size())
+        mImages.removeAt(currFileIdx);
+
+    // Do not emit updateDirSignal here: File Preview / thumb scene rebuild
+    // the whole list (and cancel in-flight thumbs). On a large folder that
+    // is another 1–2s UI stall. Scrollbar max is updated cheaply below.
+
+    QSharedPointer<DkImageContainerT> imgC;
+    if (!mImages.isEmpty()) {
+        int nextIdx = currFileIdx;
+        if (nextIdx < 0)
+            nextIdx = 0;
+        if (nextIdx >= mImages.size())
+            nextIdx = mImages.size() - 1;
+        imgC = mImages.at(nextIdx);
+    }
     load(imgC);
     emit showInfoSignal(tr("%1 deleted...").arg(fileName));
     return true;
@@ -1453,6 +1534,11 @@ void DkImageLoader::rotateImage(double angle)
  **/
 void DkImageLoader::directoryChanged(const QString &path)
 {
+    if (QDateTime::currentMSecsSinceEpoch() < mIgnoreDirChangesUntil) {
+        qInfo() << "[Loader] ignoring directory change after our own delete";
+        return;
+    }
+
     if (path.isEmpty() || path == mCurrentDir) {
         mFolderUpdated = true;
 

@@ -636,25 +636,30 @@ void DkViewPort::deleteImage()
 
     getController()->applyPluginChanges(true);
 
-    QFileInfo fileInfo(imgC->filePath());
-    QString question;
+    int answer = QMessageBox::Yes;
+    if (const auto remembered = DkMessageBox::rememberedAnswer(QStringLiteral("deleteFileDialog"))) {
+        answer = *remembered;
+    } else {
+        QFileInfo fileInfo(imgC->filePath());
+        QString question;
 
 #if defined(Q_OS_WIN) || defined(Q_OS_LINUX)
-    question = tr("Shall I move %1 to trash?").arg(fileInfo.fileName());
+        question = tr("Shall I move %1 to trash?").arg(fileInfo.fileName());
 #else
-    question = tr("Do you want to permanently delete %1?").arg(fileInfo.fileName());
+        question = tr("Do you want to permanently delete %1?").arg(fileInfo.fileName());
 #endif
 
-    DkMessageBox msgBox(QMessageBox::Question,
-                        tr("Delete File"),
-                        question,
-                        (QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel),
-                        this);
+        DkMessageBox msgBox(QMessageBox::Question,
+                            tr("Delete File"),
+                            question,
+                            (QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel),
+                            this);
 
-    msgBox.setDefaultButton(QMessageBox::Yes);
-    msgBox.setObjectName("deleteFileDialog");
+        msgBox.setDefaultButton(QMessageBox::Yes);
+        msgBox.setObjectName("deleteFileDialog");
 
-    int answer = msgBox.exec();
+        answer = msgBox.exec();
+    }
 
     if (answer == QMessageBox::Accepted || answer == QMessageBox::Yes)
         mLoader->deleteFile();

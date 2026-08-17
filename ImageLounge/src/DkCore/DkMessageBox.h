@@ -29,6 +29,8 @@
 
 #include <QMessageBox>
 
+#include <optional>
+
 #include "nmc_config.h"
 
 class QDialogButtonBox;
@@ -56,6 +58,9 @@ public:
     void setDefaultButton(QMessageBox::StandardButton button);
     void setButtonText(QMessageBox::StandardButton button, const QString &text);
     void setCheckBoxText(const QString &text);
+
+    // If the user chose Remember my choice and it has not expired, returns that answer.
+    static std::optional<int> rememberedAnswer(const QString &dialogId);
 
 public slots:
     void buttonClicked(QAbstractButton *button);

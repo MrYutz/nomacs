@@ -32,6 +32,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDialogButtonBox>
 #include <QGridLayout>
 #include <QGuiApplication>
@@ -184,11 +185,20 @@ void DkMessageBox::setVisible(bool visible)
     QDialog::setVisible(visible);
 }
 
-int DkMessageBox::exec()
+namespace
 {
-    const qulonglong sessionId = DkSettingsManager::param().global().sessionId;
 
-    const QString dialogId = objectName();
+struct DialogMemory {
+    bool show = true;
+    int answer = QDialog::Accepted;
+    int option = 0;
+};
+
+DialogMemory readDialogMemory(const QString &dialogId)
+{
+    DialogMemory mem;
+
+    const qulonglong sessionId = DkSettingsManager::param().global().sessionId;
     const QString answerKey = dialogId + "-answer";
     const QString optionKey = dialogId + "-option";
     const QString timeKey = dialogId + "-time";
@@ -197,52 +207,75 @@ int DkMessageBox::exec()
     DefaultSettings settings;
     settings.beginGroup("DkDialog");
 
-    bool show = settings.value(dialogId, true).toBool();
-    int answer = settings.value(answerKey, QDialog::Accepted).toInt();
-    const int option = settings.value(optionKey, opt_forever).toInt();
+    mem.show = settings.value(dialogId, true).toBool();
+    mem.answer = settings.value(answerKey, QDialog::Accepted).toInt();
+    mem.option = settings.value(optionKey, 0).toInt();
     const QDateTime time = settings.value(timeKey).toDateTime();
 
-    // if the dialog times out show with the last options chosen
-    mShowAgain->setChecked(!show);
-    mOptionBox->setEnabled(!show);
-    mOptionBox->setCurrentIndex(option);
-
-    if (!show) {
+    if (!mem.show) {
         QDateTime expiration;
         const QDateTime now = QDateTime::currentDateTime();
         const QDateTime future = now.addSecs(60 * 60);
         const QDateTime past = now.addSecs(-60 * 60);
 
-        switch (option) {
-        case opt_forever:
+        switch (mem.option) {
+        case 0: // opt_forever
             expiration = future;
             break;
-        case opt_session: {
-            qulonglong savedId = settings.value(sessionKey).toULongLong();
+        case 1: { // opt_session
+            const qulonglong savedId = settings.value(sessionKey).toULongLong();
             expiration = sessionId == savedId ? future : past;
             break;
         }
-        case opt_hour:
+        case 2: // opt_hour
             expiration = time.addSecs(60 * 60);
             break;
-        case opt_day:
+        case 3: // opt_day
             expiration = time.date().endOfDay();
             break;
-        case opt_week:
+        case 4: // opt_week
             expiration = time.date().addDays(6).endOfDay();
             break;
         default:
-            qWarning() << "unknown dialog option:" << settings.group() << optionKey << option;
+            qWarning() << "unknown dialog option:" << settings.group() << optionKey << mem.option;
             expiration = past;
             break;
         }
-        show = now > expiration;
+        mem.show = now > expiration;
     }
 
-    if (!show) {
-        qInfo() << this << "skipped with answer" << static_cast<QMessageBox::StandardButton>(answer) << answer;
-        return answer;
+    return mem;
+}
+
+}
+
+std::optional<int> DkMessageBox::rememberedAnswer(const QString &dialogId)
+{
+    if (dialogId.isEmpty())
+        return std::nullopt;
+
+    const DialogMemory mem = readDialogMemory(dialogId);
+    if (mem.show)
+        return std::nullopt;
+    return mem.answer;
+}
+
+int DkMessageBox::exec()
+{
+    const QString dialogId = objectName();
+    const DialogMemory mem = readDialogMemory(dialogId);
+
+    // if the dialog times out show with the last options chosen
+    mShowAgain->setChecked(!mem.show);
+    mOptionBox->setEnabled(!mem.show);
+    mOptionBox->setCurrentIndex(mem.option);
+
+    if (!mem.show) {
+        qInfo() << this << "skipped with answer" << static_cast<QMessageBox::StandardButton>(mem.answer) << mem.answer;
+        return mem.answer;
     }
+
+    int answer = mem.answer;
 
     if (testAttribute(Qt::WA_DeleteOnClose)) {
         qFatal("WA_DeleteOnClose deletes before exec() returns!");
@@ -251,14 +284,21 @@ int DkMessageBox::exec()
 
     answer = QDialog::exec();
 
-    show = !mShowAgain->isChecked();
+    const bool remember = mShowAgain->isChecked();
+    const QString answerKey = dialogId + "-answer";
+    const QString optionKey = dialogId + "-option";
+    const QString timeKey = dialogId + "-time";
+    const QString sessionKey = "sessionId";
 
-    if (!show && answer != QMessageBox::NoButton && answer != QMessageBox::Cancel) {
+    DefaultSettings settings;
+    settings.beginGroup("DkDialog");
+
+    if (remember && answer != QMessageBox::NoButton && answer != QMessageBox::Cancel) {
         settings.setValue(dialogId, false);
         settings.setValue(answerKey, answer);
         settings.setValue(optionKey, mOptionBox->currentIndex());
         settings.setValue(timeKey, QDateTime::currentDateTime());
-        settings.setValue(sessionKey, sessionId);
+        settings.setValue(sessionKey, DkSettingsManager::param().global().sessionId);
     } else {
         settings.remove(dialogId);
         settings.remove(answerKey);

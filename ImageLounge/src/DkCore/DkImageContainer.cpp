@@ -580,10 +580,10 @@ void DkImageContainerT::fetchFile()
         mLoadState = loading; // uncancel loading - we had another call
         return;
     }
-    if (mFetchingImage)
-        mImageWatcher.waitForFinished();
-    // I think we missed to return here
-    if (mFetchingBuffer)
+    // Never waitForFinished() on the UI thread — on a network share that
+    // blocks for the entire read/decode (1–2s+). If a load is already in
+    // flight, let it finish and deliver via the watcher.
+    if (mFetchingImage || mFetchingBuffer)
         return;
 
     // ignore doubled calls
@@ -621,10 +621,7 @@ void DkImageContainerT::bufferLoaded()
 
 void DkImageContainerT::fetchImage()
 {
-    if (mFetchingBuffer)
-        mBufferWatcher.waitForFinished();
-
-    if (mFetchingImage) {
+    if (mFetchingBuffer || mFetchingImage) {
         mLoadState = loading;
         return;
     }
