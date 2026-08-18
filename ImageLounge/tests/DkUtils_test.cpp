@@ -1,5 +1,6 @@
 #include "../src/DkCore/DkUtils.h"
 #include "DkVersion.h"
+#include <QString>
 #include <gtest/gtest.h>
 #include <string>
 
@@ -21,6 +22,15 @@ TEST(DkFileNameConverterTest, Test)
     nmc::DkFileNameConverter lower("<c:1>.png");
     EXPECT_EQ(lower.convert("teSt_ImaGe.jpg", 0).toStdString(), std::string("test_image.png"));
 }
+
+#ifdef Q_OS_WIN
+TEST(DkUtilsTrash, LocalFixedDriveStillUsesTrash)
+{
+    // C: is almost always a local volume with a Recycle Bin. Network/mapped
+    // drives must take the skip-trash path instead (ISSUE-1).
+    EXPECT_FALSE(nmc::DkUtils::trashLikelyUnavailable(QStringLiteral("C:/Windows")));
+}
+#endif
 
 TEST(DkFileNameConverterTest, OldIndex)
 {

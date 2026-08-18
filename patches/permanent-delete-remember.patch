@@ -1,0 +1,72 @@
+--- a/ImageLounge/src/DkCore/DkUtils.cpp
++++ b/ImageLounge/src/DkCore/DkUtils.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include "DkMath.h"
+ #include "DkNoMacs.h"
++#include "DkMessageBox.h"
+ #include "DkSettings.h"
+ #include "DkVersion.h"
+ #include "DkViewPort.h"
+@@ -1147,40 +1148,32 @@
+             if (yesToAll) {
+                 result = QMessageBox::YesToAll;
+             } else {
+-                // This is mostly going to show up on Windows, format dialog similar to Explorer.
+-                // Warning is standard HIG practice for destructive actions
+-                QMessageBox msgBox( //
+-                    QMessageBox::Warning,
+-                    QObject::tr("Delete File Permanently?"),
+-                    QObject::tr("I could not move this file to the trash.\n"
+-                                "Would you like to permanently delete this file?\n\n"
+-                                "%1\n"
+-                                "Size: %2\n"
+-                                "Date modified: %3\n\n"
+-                                "This action cannot be undone.\n")
+-                        .arg(fileInfo.fileName())
+-                        .arg(DkUtils::readableByte(fileInfo.size()))
+-                        .arg(fileInfo.lastModified().toString()),
+-                    QMessageBox::NoButton,
+-                    DkUtils::getMainWindow());
+-
+-                // Don't use the plain "Yes" or "Yes to All" since this is destructive
+-                QPushButton *deleteButton = msgBox.addButton(QObject::tr("&Delete"), QMessageBox::DestructiveRole);
+-                QPushButton *deleteAllButton = nullptr;
++                // Use DkMessageBox so "Remember my choice" works (e.g. network drives with no trash).
++                QMessageBox::StandardButtons buttons = QMessageBox::Yes | QMessageBox::Cancel;
+                 if (files.count() > 1)
+-                    deleteAllButton = msgBox.addButton(QObject::tr("Delete &All"), QMessageBox::DestructiveRole);
++                    buttons |= QMessageBox::YesToAll;
+ 
+-                msgBox.addButton(QMessageBox::Cancel);
++                DkMessageBox msgBox(QMessageBox::Warning,
++                                    QObject::tr("Delete File Permanently?"),
++                                    QObject::tr("I could not move this file to the trash.\n"
++                                                "Would you like to permanently delete this file?\n\n"
++                                                "%1\n"
++                                                "Size: %2\n"
++                                                "Date modified: %3\n\n"
++                                                "This action cannot be undone.\n")
++                                        .arg(fileInfo.fileName())
++                                        .arg(DkUtils::readableByte(fileInfo.size()))
++                                        .arg(fileInfo.lastModified().toString()),
++                                    buttons,
++                                    DkUtils::getMainWindow());
++
++                msgBox.setObjectName("permanentDeleteDialog");
++                msgBox.setButtonText(QMessageBox::Yes, QObject::tr("&Delete"));
++                if (files.count() > 1)
++                    msgBox.setButtonText(QMessageBox::YesToAll, QObject::tr("Delete &All"));
+                 msgBox.setDefaultButton(QMessageBox::Cancel);
+ 
+                 result = msgBox.exec();
+-                QAbstractButton *clicked = msgBox.clickedButton();
+-                if (clicked) {
+-                    if (clicked == deleteButton)
+-                        result = QMessageBox::Yes;
+-                    if (clicked == deleteAllButton)
+-                        result = QMessageBox::YesToAll;
+-                }
+             }
+ 
+             switch (result) {

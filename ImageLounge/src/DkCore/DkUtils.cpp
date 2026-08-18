@@ -29,6 +29,7 @@
 
 #include "DkMath.h"
 #include "DkNoMacs.h"
+#include "DkMessageBox.h"
 #include "DkSettings.h"
 #include "DkVersion.h"
 #include "DkViewPort.h"
@@ -43,6 +44,8 @@
 #include <QFileInfo>
 #include <QMainWindow>
 #include <QMessageBox>
+#include <QSet>
+#include <QStorageInfo>
 #include <QMimeDatabase>
 #include <QMouseEvent>
 #include <QPushButton>
@@ -80,6 +83,10 @@
 
 #ifdef Q_OS_WIN
 #include "shlwapi.h"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #pragma comment(lib, "shlwapi.lib")
 #endif
 
@@ -1102,102 +1109,167 @@ QStringList DkUtils::filterStringList(const QString &query, const QStringList &l
     return resultList;
 }
 
+namespace
+{
+
+const char *kPermanentDeleteDialog = "permanentDeleteDialog";
+
+QSet<QString> sTrashUnavailableRoots;
+
+QString storageRootPath(const QString &filePath)
+{
+#ifdef Q_OS_WIN
+    // Avoid QStorageInfo on the hot delete path — it can query the volume.
+    if (filePath.size() >= 2 && filePath.at(1) == QLatin1Char(':'))
+        return QDir::fromNativeSeparators(filePath.left(2).toUpper()) + QLatin1Char('/');
+#endif
+    const QString root = QStorageInfo(filePath).rootPath();
+    if (!root.isEmpty())
+        return QDir::cleanPath(root);
+    return QDir::cleanPath(QFileInfo(filePath).absolutePath());
+}
+
+void markTrashUnavailable(const QString &filePath)
+{
+    const QString root = storageRootPath(filePath);
+    if (!root.isEmpty())
+        sTrashUnavailableRoots.insert(root);
+}
+
+int confirmPermanentDelete(const QFileInfo &fileInfo, int fileCount)
+{
+    if (const auto remembered = DkMessageBox::rememberedAnswer(kPermanentDeleteDialog)) {
+        qInfo() << "[moveToTrash] using remembered permanent-delete answer" << *remembered;
+        return *remembered;
+    }
+
+    QMessageBox::StandardButtons buttons = QMessageBox::Yes | QMessageBox::Cancel;
+    if (fileCount > 1)
+        buttons |= QMessageBox::YesToAll;
+
+    DkMessageBox msgBox(QMessageBox::Warning,
+                        QObject::tr("Delete File Permanently?"),
+                        QObject::tr("I could not move this file to the trash.\n"
+                                    "Would you like to permanently delete this file?\n\n"
+                                    "%1\n"
+                                    "Size: %2\n"
+                                    "Date modified: %3\n\n"
+                                    "This action cannot be undone.\n")
+                            .arg(fileInfo.fileName())
+                            .arg(DkUtils::readableByte(fileInfo.size()))
+                            .arg(fileInfo.lastModified().toString()),
+                        buttons,
+                        DkUtils::getMainWindow());
+
+    msgBox.setObjectName(kPermanentDeleteDialog);
+    msgBox.setButtonText(QMessageBox::Yes, QObject::tr("&Delete"));
+    if (fileCount > 1)
+        msgBox.setButtonText(QMessageBox::YesToAll, QObject::tr("Delete &All"));
+    msgBox.setDefaultButton(QMessageBox::Cancel);
+
+    return msgBox.exec();
+}
+
+}
+
+bool DkUtils::trashLikelyUnavailable(const QString &filePath)
+{
+    const QString root = storageRootPath(filePath);
+    if (sTrashUnavailableRoots.contains(root))
+        return true;
+
+#ifdef Q_OS_WIN
+    QString query = QDir::toNativeSeparators(root);
+    if (!query.endsWith(QLatin1Char('\\')))
+        query += QLatin1Char('\\');
+
+    const UINT type = GetDriveTypeW(reinterpret_cast<LPCWSTR>(query.utf16()));
+    if (type == DRIVE_REMOTE || type == DRIVE_CDROM)
+        return true;
+#else
+    const QByteArray fs = QStorageInfo(filePath).fileSystemType().toLower();
+    if (fs == "cifs" || fs == "smb" || fs == "smb2" || fs == "nfs" || fs == "nfs4" || fs.contains("fuse"))
+        return true;
+#endif
+
+    return false;
+}
+
 bool DkUtils::moveToTrash(const QStringList &files)
 {
     bool yesToAll = false;
-    for (auto &filePath : files) {
-        bool ok = false;
+    for (const auto &filePath : files) {
         QFileInfo fileInfo(filePath);
 
-        // resolve the path, works around qt bug. See nomacs#1627
-        QFile file(fileInfo.canonicalFilePath());
+        // canonicalFilePath() can stall on SMB (GetFinalPathNameByHandle).
+        // Only use it on local volumes (workaround for nomacs#1627).
+        const bool remote = trashLikelyUnavailable(filePath);
+        const QString resolved = remote ? fileInfo.absoluteFilePath() : fileInfo.canonicalFilePath();
+        QFile file(resolved.isEmpty() ? filePath : resolved);
 
         // delete links first; exists() will fail on a broken symlink
         if (fileInfo.isSymLink()) {
             qInfo() << "[moveToTrash] deleting symlink" << filePath;
-            ok = file.remove();
-        } else if (!fileInfo.exists()) {
-            qWarning() << "[moveToTrash] cannot delete a non-existing file:" << filePath;
-            continue;
-        } else if (yesToAll) {
-            qWarning() << "[moveToTrash] deleting without confirmation:" << filePath;
-            ok = true;
-        } else {
-            qInfo() << "[moveToTrash] moving:" << filePath;
-            ok = file.moveToTrash();
-            if (ok) {
-                qInfo() << "[moveToTrash] moved to:" << file.fileName();
-            }
-        }
-
-        if (!ok) {
-            // clang-format off
-            qWarning().nospace() << "[moveToTrash] error:" << file.errorString()
-                            << "\n\terror:" << file.error()
-                            << "\n\tisFile:" << fileInfo.isFile()
-                            << "\n\tfile permissions:" << file.permissions()
-                            << "\n\tdir permissions:" << QFileInfo(fileInfo.absolutePath()).permissions()
-                            << "\n\towner:" << fileInfo.owner()
-                            << "\n\tgroup:" << fileInfo.group();
-            // clang-format on
-        }
-
-        if (!ok || yesToAll) {
-            int result = 0;
-            if (yesToAll) {
-                result = QMessageBox::YesToAll;
-            } else {
-                // This is mostly going to show up on Windows, format dialog similar to Explorer.
-                // Warning is standard HIG practice for destructive actions
-                QMessageBox msgBox( //
-                    QMessageBox::Warning,
-                    QObject::tr("Delete File Permanently?"),
-                    QObject::tr("I could not move this file to the trash.\n"
-                                "Would you like to permanently delete this file?\n\n"
-                                "%1\n"
-                                "Size: %2\n"
-                                "Date modified: %3\n\n"
-                                "This action cannot be undone.\n")
-                        .arg(fileInfo.fileName())
-                        .arg(DkUtils::readableByte(fileInfo.size()))
-                        .arg(fileInfo.lastModified().toString()),
-                    QMessageBox::NoButton,
-                    DkUtils::getMainWindow());
-
-                // Don't use the plain "Yes" or "Yes to All" since this is destructive
-                QPushButton *deleteButton = msgBox.addButton(QObject::tr("&Delete"), QMessageBox::DestructiveRole);
-                QPushButton *deleteAllButton = nullptr;
-                if (files.count() > 1)
-                    deleteAllButton = msgBox.addButton(QObject::tr("Delete &All"), QMessageBox::DestructiveRole);
-
-                msgBox.addButton(QMessageBox::Cancel);
-                msgBox.setDefaultButton(QMessageBox::Cancel);
-
-                result = msgBox.exec();
-                QAbstractButton *clicked = msgBox.clickedButton();
-                if (clicked) {
-                    if (clicked == deleteButton)
-                        result = QMessageBox::Yes;
-                    if (clicked == deleteAllButton)
-                        result = QMessageBox::YesToAll;
-                }
-            }
-
-            switch (result) {
-            case QMessageBox::YesToAll:
-                yesToAll = true;
-                [[fallthrough]];
-            case QMessageBox::Yes:
-                ok = file.remove();
-                if (!ok) {
-                    qWarning() << "[moveToTrash] delete error:" << file.errorString();
-                    return false;
-                }
-                qInfo() << "[moveToTrash] deleted " << file.fileName();
-                break;
-            default:
+            if (!file.remove()) {
+                qWarning() << "[moveToTrash] delete error:" << file.errorString();
                 return false;
             }
+            continue;
+        }
+
+        if (!remote && !fileInfo.exists()) {
+            qWarning() << "[moveToTrash] cannot delete a non-existing file:" << filePath;
+            continue;
+        }
+
+        const bool skipTrash = yesToAll || remote;
+        bool trashed = false;
+
+        if (skipTrash) {
+#ifdef Q_OS_WIN
+            // Match Explorer: DeleteFileW, no extra Qt stat/recycle calls.
+            const QString native = QDir::toNativeSeparators(resolved.isEmpty() ? filePath : resolved);
+            SetFileAttributesW(reinterpret_cast<LPCWSTR>(native.utf16()), FILE_ATTRIBUTE_NORMAL);
+            if (!DeleteFileW(reinterpret_cast<LPCWSTR>(native.utf16()))) {
+                qWarning() << "[moveToTrash] DeleteFileW failed" << filePath << "err" << GetLastError();
+                return false;
+            }
+            qInfo() << "[moveToTrash] DeleteFileW" << filePath;
+            continue;
+#endif
+        }
+
+        if (!skipTrash) {
+            qInfo() << "[moveToTrash] moving:" << filePath;
+            trashed = file.moveToTrash();
+            if (trashed) {
+                qInfo() << "[moveToTrash] moved to:" << file.fileName();
+                continue;
+            }
+
+            // Recycle failed (common on some volumes). Do not call owner()/group()
+            // here: those SID lookups can take seconds on Windows SMB shares.
+            qWarning() << "[moveToTrash] trash failed:" << file.errorString() << "error:" << file.error();
+            markTrashUnavailable(filePath);
+        } else if (!yesToAll) {
+            qInfo() << "[moveToTrash] skipping trash (network/unavailable):" << filePath;
+        }
+
+        const int result = yesToAll ? int(QMessageBox::YesToAll) : confirmPermanentDelete(fileInfo, files.count());
+
+        switch (result) {
+        case QMessageBox::YesToAll:
+            yesToAll = true;
+            [[fallthrough]];
+        case QMessageBox::Yes:
+            if (!file.remove()) {
+                qWarning() << "[moveToTrash] delete error:" << file.errorString();
+                return false;
+            }
+            qInfo() << "[moveToTrash] deleted" << file.fileName();
+            break;
+        default:
+            return false;
         }
     }
 

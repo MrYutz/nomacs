@@ -283,6 +283,7 @@ public slots:
     void showFile(const QString &filePath = QString());
     void selectAllThumbs(bool select = true);
     void updateThumbs(QVector<QSharedPointer<DkImageContainerT>> thumbs);
+    void removeFiles(const QStringList &paths);
     void deleteSelected();
     void copySelected() const;
     void pasteImages() const;

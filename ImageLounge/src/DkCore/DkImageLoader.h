@@ -83,6 +83,9 @@ public:
     bool hasMovie() const;
     bool hasSvg() const;
 
+    void suppressDirWatcher(int ms = 750);
+    void resumeDirWatcher();
+    void removeFilesFromIndex(const QStringList &paths);
     void activate(bool isActive = true);
     bool hasImage() const;
     bool isEdited() const;
@@ -186,6 +189,7 @@ protected:
     QSharedPointer<DkImageContainerT> mCurrentImage;
     QSharedPointer<DkImageContainerT> mLastImageLoaded;
     bool mFolderUpdated = false;
+    qint64 mIgnoreDirChangesUntil = 0;
     bool mSortingImages = false;
     bool mSortingIsDirty = false;
     bool mOrientationWarningShown = false;

@@ -54,6 +54,7 @@
 #include <QPixmapCache>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QSet>
 #include <QScrollBar>
 #include <QStringBuilder>
 #include <QStyleOptionGraphicsItem>
@@ -1265,6 +1266,71 @@ DkThumbScene::DkThumbScene(DkThumbLoader *thumbLoader, QWidget *parent /* = 0 */
                                        });
 }
 
+void DkThumbScene::removeFiles(const QStringList &paths)
+{
+    if (paths.isEmpty())
+        return;
+
+    const QSet<QString> gone(paths.begin(), paths.end());
+
+    QVector<DkFileInfo> kept;
+    kept.reserve(mThumbs.size());
+    for (const auto &info : std::as_const(mThumbs)) {
+        if (!gone.contains(info.path()))
+            kept.append(info);
+    }
+    mThumbs.swap(kept);
+
+    for (int i = mThumbLabels.size() - 1; i >= 0; --i) {
+        DkThumbLabel *label = mThumbLabels.at(i);
+        if (!gone.contains(label->filePath()))
+            continue;
+        mThumbLabels.removeAt(i);
+        removeItem(label);
+        label->deleteLater();
+    }
+
+    // Reposition only. Do not setFileInfo() (that stats every file on SMB)
+    // and do not cancelLoading() on every remaining thumb.
+    if (mThumbs.isEmpty()) {
+        update();
+        return;
+    }
+
+    QGraphicsView *view = getView();
+    if (!view) {
+        update();
+        return;
+    }
+
+    QSize pSize = view->viewport()->size();
+    int psz = qRound(DkSettingsManager::param().display().thumbPreviewSize / view->devicePixelRatio());
+    mXOffset = 2;
+    mNumCols = qMax(qFloor(((float)pSize.width() - mXOffset) / (psz + mXOffset)), 1);
+    mNumCols = qMin(mThumbs.size(), mNumCols);
+    mNumRows = qCeil((float)mThumbs.size() / mNumCols);
+
+    int tso = psz + mXOffset;
+    setSceneRect(0, 0, mNumCols * tso + mXOffset, mNumRows * tso + mXOffset);
+
+    int cYOffset = mXOffset;
+    for (int rIdx = 0; rIdx < mNumRows; rIdx++) {
+        int cXOffset = mXOffset;
+        for (int cIdx = 0; cIdx < mNumCols; cIdx++) {
+            int tIdx = rIdx * mNumCols + cIdx;
+            if (tIdx < 0 || tIdx >= mThumbLabels.size())
+                break;
+            DkThumbLabel *cLabel = mThumbLabels.at(tIdx);
+            cLabel->setPos(cXOffset, cYOffset);
+            cLabel->setGridPos(tIdx, rIdx, cIdx);
+            cXOffset += psz + mXOffset;
+        }
+        cYOffset += psz + mXOffset;
+    }
+
+    update();
+}
+
 void DkThumbScene::updateLayout()
 {
     if (mThumbs.empty())
@@ -1473,6 +1539,10 @@ void DkThumbScene::keyPressEvent(QKeyEvent *event)
     int to;
 
     switch (event->key()) {
+    case Qt::Key_Delete:
+        deleteSelected();
+        event->accept();
+        return;
     case Qt::Key_Left: {
         to = from - 1;
         break;
@@ -1828,25 +1898,45 @@ void DkThumbScene::copyImages(const QMimeData *mimeData, const Qt::DropAction &d
 
 void DkThumbScene::deleteSelected()
 {
-    const int numFiles = getSelectedThumbs().size();
-
-    if (numFiles <= 0)
+    const QStringList files = getSelectedFiles();
+    if (files.isEmpty())
         return;
 
-    DkMessageBox msgBox(QMessageBox::Question,
-                        tr("Delete File"),
-                        tr("Shall I move %1 file(s) to trash?").arg(numFiles),
-                        (QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel),
-                        DkUtils::getMainWindow());
+    int answer = QMessageBox::Yes;
+    if (const auto remembered = DkMessageBox::rememberedAnswer(QStringLiteral("deleteThumbFileDialog"))) {
+        answer = *remembered;
+    } else {
+        DkMessageBox msgBox(QMessageBox::Question,
+                            tr("Delete File"),
+                            tr("Shall I move %1 file(s) to trash?").arg(files.size()),
+                            (QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel),
+                            DkUtils::getMainWindow());
 
-    msgBox.setDefaultButton(QMessageBox::Yes);
-    msgBox.setObjectName("deleteThumbFileDialog");
-
-    int answer = msgBox.exec();
-
-    if (answer == QMessageBox::Yes || answer == QMessageBox::Accepted) {
-        (void)DkUtils::moveToTrash(getSelectedFiles());
+        msgBox.setDefaultButton(QMessageBox::Yes);
+        msgBox.setObjectName("deleteThumbFileDialog");
+        answer = msgBox.exec();
     }
+
+    if (answer != QMessageBox::Yes && answer != QMessageBox::Accepted)
+        return;
+
+    DkTimer dt;
+    if (mLoader)
+        mLoader->suppressDirWatcher();
+
+    const bool deleted = DkUtils::moveToTrash(files);
+    qInfo() << "[thumbs] moveToTrash" << files.size() << "files in" << dt;
+
+    if (mLoader) {
+        if (deleted)
+            mLoader->removeFilesFromIndex(files);
+        mLoader->resumeDirWatcher();
+    }
+
+    if (deleted)
+        removeFiles(files);
+
+    qInfo() << "[thumbs] deleteSelected total" << dt;
 }
 
 void DkThumbScene::renameSelected() const
@@ -2481,6 +2571,10 @@ void DkThumbScrollWidget::connectToActions(bool activate)
     for (QAction *a : am.previewActions()) {
         a->setEnabled(activate);
     }
+
+    // Both preview_delete and menu_edit_delete bind Delete. While the
+    // thumbnail view is active, only the preview action should fire.
+    am.action(DkActionManager::menu_edit_delete)->setEnabled(!activate);
 
     if (activate) {
         connect(am.action(DkActionManager::preview_select_all),
